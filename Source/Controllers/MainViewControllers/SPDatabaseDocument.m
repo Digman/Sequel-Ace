@@ -5341,6 +5341,10 @@ static _Atomic int SPDatabaseDocumentInstanceCounter = 0;
 
 - (BOOL)selectMySQLDatabase:(NSString *)name
 {
+    // Invalidate any in-flight schema introspection before the connection's
+    // active database changes, so a slow refresh against the old database
+    // cannot swap stale tables into the new database's UI.
+    [tablesListInstance bumpSchemaRefreshGeneration];
     return [mySQLConnection selectDatabase:name];
 }
 

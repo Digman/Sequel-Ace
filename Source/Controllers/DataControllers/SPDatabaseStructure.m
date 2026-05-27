@@ -137,6 +137,19 @@
 
 - (void)queryDbStructureInBackgroundWithUserInfo:(NSDictionary *)userInfo
 {
+	// Per-favorite schema-loading mode gate. Light/Manual skip the implicit
+	// column fan-out so navigator / autocomplete metadata stays untouched
+	// until the user opts in. Explicit user-driven refreshes set
+	// `forceUpdate` and bypass this gate so DDL change / Refresh / rename
+	// / drop / import flows still fetch full structure on demand.
+	if ([self.delegate respondsToSelector:@selector(currentSchemaLoadingMode)]) {
+		NSInteger mode = [self.delegate currentSchemaLoadingMode];
+		BOOL isExplicit = [[userInfo objectForKey:@"forceUpdate"] boolValue];
+		if (!isExplicit && (mode == SASchemaLoadingModeLight || mode == SASchemaLoadingModeManual)) {
+			return;
+		}
+	}
+
 	[NSThread detachNewThreadWithName:SPCtxt(@"SPNavigatorController database structure querier", self.delegate)
 							   target:self
 							 selector:@selector(queryDbStructureWithUserInfo:)

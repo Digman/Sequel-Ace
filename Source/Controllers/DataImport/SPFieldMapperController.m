@@ -489,22 +489,27 @@ static NSUInteger SPSourceColumnTypeInteger     = 1;
 		[tableTargetPopup addItemWithTitle:NSLocalizedString(@"Refresh List", @"refresh list menu item")];
 		[[tableTargetPopup menu] addItem:[NSMenuItem separatorItem]];
 
-		// Update tables list
-		[tablesListInstance updateTables:nil];
-		if(allTableNames) {
-			[tableTargetPopup addItemsWithTitles:allTableNames];
-		}
+		// Refresh the tables list, then repopulate / reselect the popup once
+		// the new list is in place. The popup repopulation must observe the
+		// freshly-fetched table set, otherwise stale names linger on screen.
+		[tablesListInstance updateTables:nil completion:^{
+			NSArray *refreshedTableNames = [self->tablesListInstance allTableNames];
+			if (refreshedTableNames) {
+				[self->tableTargetPopup addItemsWithTitles:refreshedTableNames];
+			}
 
-		// Select either the currently selected table, or the first item in the list, or if no table in db switch to "New Table" mode
-		if ([[tablesListInstance selectedTableAndViewNames] count]
-				&& [allTableNames containsObject:[[tablesListInstance selectedTableAndViewNames] objectAtIndex:0]]) {
-			[tableTargetPopup selectItemWithTitle:[[tablesListInstance selectedTableAndViewNames] objectAtIndex:0]];
-		} else {
-			if([allTableNames count])
-				[tableTargetPopup selectItemAtIndex:3];
-			else
-				[tableTargetPopup selectItemAtIndex:0];
-		}
+			NSArray *selection = [self->tablesListInstance selectedTableAndViewNames];
+			if ([selection count]
+				&& [refreshedTableNames containsObject:[selection objectAtIndex:0]]) {
+				[self->tableTargetPopup selectItemWithTitle:[selection objectAtIndex:0]];
+			} else {
+				if ([refreshedTableNames count]) {
+					[self->tableTargetPopup selectItemAtIndex:3];
+				} else {
+					[self->tableTargetPopup selectItemAtIndex:0];
+				}
+			}
+		}];
 
 		return;
 

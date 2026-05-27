@@ -698,11 +698,13 @@
 	// Update current selected database
 	[tableDocumentInstance refreshCurrentDatabase];
 
-	// Update current database tables 
-	[tablesListInstance updateTables:self];
-	
-	// Re-query the structure of all databases in the background
-	[[tableDocumentInstance databaseStructureRetrieval] queryDbStructureInBackgroundWithUserInfo:@{@"forceUpdate" : @YES}];
+	// Update current database tables, then force a column structure refresh
+	// once the new list is in place. The structure refresh must run after the
+	// table list swap so newly imported rows are visible to the navigator.
+	__weak SPDatabaseDocument *weakDoc = tableDocumentInstance;
+	[tablesListInstance updateTables:self completion:^{
+		[[weakDoc databaseStructureRetrieval] queryDbStructureInBackgroundWithUserInfo:@{@"forceUpdate" : @YES}];
+	}];
 
 	// Import finished notification
 	NSUserNotification *notification = [[NSUserNotification alloc] init];
@@ -1197,17 +1199,17 @@
 
 		if(self->importIntoNewTable) {
 
-			// Select the new table
-			
-			// Update current database tables
-			[self->tablesListInstance updateTables:self];
-			
-			// Re-query the structure of all databases in the background
-			[[self->tableDocumentInstance databaseStructureRetrieval] queryDbStructureInBackgroundWithUserInfo:@{@"forceUpdate" : @YES}];
-			
-			// Select the new table
-			[self->tablesListInstance selectItemWithName:self->selectedTableTarget];
-			
+			// Refresh the tables list, then force a column structure refresh
+			// and select the newly imported table once the swap completes —
+			// each step must observe the previous step's result.
+			__weak SPDataImport *weakSelf = self;
+			[self->tablesListInstance updateTables:self completion:^{
+				SPDataImport *strongSelf = weakSelf;
+				if (!strongSelf) return;
+				[[strongSelf->tableDocumentInstance databaseStructureRetrieval] queryDbStructureInBackgroundWithUserInfo:@{@"forceUpdate" : @YES}];
+				[strongSelf->tablesListInstance selectItemWithName:strongSelf->selectedTableTarget];
+			}];
+
 		} else {
 			
 			// If import was done into a new table or the table selected for import is also selected in the content view,

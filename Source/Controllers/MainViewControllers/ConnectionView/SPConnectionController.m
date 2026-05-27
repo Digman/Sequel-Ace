@@ -1412,6 +1412,21 @@ sslCACertFileLocationEnabled:(sslCACertFileLocationEnabled != NSControlStateValu
         }
     }
 
+    // Schema loading mode — missing key defaults to Auto (0). All five
+    // popups share state; populate every form's selection in sync.
+    NSInteger schemaModeRaw = [fav objectForKey:SPFavoriteSchemaLoadingModeKey]
+        ? [[fav objectForKey:SPFavoriteSchemaLoadingModeKey] integerValue]
+        : SASchemaLoadingModeAuto;
+    if (schemaModeRaw < SASchemaLoadingModeAuto || schemaModeRaw > SASchemaLoadingModeManual) {
+        schemaModeRaw = SASchemaLoadingModeAuto;
+    }
+    [self setSchemaLoadingMode:schemaModeRaw];
+    [standardSchemaLoadingPopUp selectItemWithTag:schemaModeRaw];
+    [socketSchemaLoadingPopUp   selectItemWithTag:schemaModeRaw];
+    [sshSchemaLoadingPopUp      selectItemWithTag:schemaModeRaw];
+    [awsIAMSchemaLoadingPopUp   selectItemWithTag:schemaModeRaw];
+    [vaultSchemaLoadingPopUp    selectItemWithTag:schemaModeRaw];
+
     //Special prefs
     [self setAllowDataLocalInfile:([fav objectForKey:SPFavoriteAllowDataLocalInfileKey] ? [[fav objectForKey:SPFavoriteAllowDataLocalInfileKey] intValue] : NSControlStateValueOff)];
 
@@ -1632,6 +1647,7 @@ sslCACertFileLocationEnabled:(sslCACertFileLocationEnabled != NSControlStateValu
         SPFavoritePortKey,
         SPFavoriteTimeZoneModeKey,
         SPFavoriteTimeZoneIdentifierKey,
+        SPFavoriteSchemaLoadingModeKey,
         SPFavoriteAllowDataLocalInfileKey,
         SPFavoriteEnableClearTextPluginKey,
         SPFavoriteUseAWSIAMAuthKey,
@@ -2002,6 +2018,8 @@ sslCACertFileLocationEnabled:(sslCACertFileLocationEnabled != NSControlStateValu
     [theFavorite setObject:[NSNumber numberWithInteger:[self colorIndex]] forKey:SPFavoriteColorIndexKey];
     [theFavorite setObject:[NSNumber numberWithInteger:[self timeZoneMode]] forKey:SPFavoriteTimeZoneModeKey];
     _setOrRemoveKey(SPFavoriteTimeZoneIdentifierKey, [self timeZoneIdentifier]);
+    // Auto/0 is a real saved value, not "missing" — always write the int.
+    [theFavorite setObject:[NSNumber numberWithInteger:[self schemaLoadingMode]] forKey:SPFavoriteSchemaLoadingModeKey];
     //Special prefs
     [theFavorite setObject:[NSNumber numberWithInteger:[self allowDataLocalInfile]] forKey:SPFavoriteAllowDataLocalInfileKey];
     // Clear text plugin
@@ -2733,7 +2751,11 @@ static NSComparisonResult _compareFavoritesUsingKey(id favorite1, id favorite2, 
     if (self.connectionDelegate) {
         [self.connectionDelegate connectionDidEstablish:mySQLConnection info:[self _buildConnectionInfo]];
     } else {
-        // Legacy path: pass the connection directly to the document.
+        // Legacy/embedded path: propagate the schema loading mode before the
+        // document picks up the connection, so SPTablesList's Manual gate and
+        // SPDatabaseStructure's mode guard see the right value on first
+        // setConnection: dispatch.
+        [dbDocument setCurrentSchemaLoadingMode:[self schemaLoadingMode]];
         [dbDocument setConnection:mySQLConnection];
     }
 }
@@ -2775,6 +2797,7 @@ static NSComparisonResult _compareFavoritesUsingKey(id favorite1, id favorite2, 
     info.connectionSSHKeychainItemAccount = connectionSSHKeychainItemAccount ?: @"";
     info.timeZoneMode = (SAConnectionTimeZoneMode)timeZoneMode;
     info.timeZoneIdentifier = timeZoneIdentifier ?: @"";
+    info.schemaLoadingMode = self.schemaLoadingMode;
     info.allowDataLocalInfile = self.allowDataLocalInfile;
     info.enableClearTextPlugin = self.enableClearTextPlugin;
     info.useAWSIAMAuth = self.useAWSIAMAuth;
@@ -3606,6 +3629,8 @@ static NSComparisonResult _compareFavoritesUsingKey(id favorite1, id favorite2, 
             [socketTimeZoneField.menu addItem:[menuItem copy]];
         }
 
+        [self setupSchemaLoadingControls];
+
         [connectionDetailsScrollView setPostsFrameChangedNotifications:YES];
         [[connectionDetailsScrollView contentView] setPostsFrameChangedNotifications:YES];
 
@@ -3707,6 +3732,177 @@ static NSComparisonResult _compareFavoritesUsingKey(id favorite1, id favorite2, 
 }
 
 // TODO: this is called once per connection screen - but the timezones don't change right? Should be static/class method?
+- (void)setupSchemaLoadingControls
+{
+    // Per-tab Schema row, mirroring the Time Zone pattern: each connection
+    // form gets its own popup, but they all bind to a single
+    // `schemaLoadingMode` property (per-favorite). The row is inserted at
+    // each form's current Time Zone position; Time Zone and all controls
+    // above it shift up 28pt, form height grows 28pt, and the existing
+    // `resizeTabViewToConnectionType:` automatically re-sizes the resize
+    // container (and through it the NSTabView / tabViewItem) using
+    // `form.height + magic`.
+    //
+    // Strings are looked up via `NSLocalizedStringWithDefaultValue` so a
+    // readable English fallback exists in code; non-English locales display
+    // it until Crowdin propagates translations.
+    const CGFloat schemaRowShift = 28.0;
+    const CGFloat labelXInset = 7.0;
+    const CGFloat labelWidth = 98.0;
+    const CGFloat popupXOffset = 108.0;
+    const CGFloat popupWidth = 252.0;
+
+    NSString *labelText = NSLocalizedStringWithDefaultValue(
+        @"SAFavoriteSchemaLoading.label", nil, [NSBundle mainBundle],
+        @"Schema:", @"Label for the per-favorite schema loading mode popup");
+    NSString *autoTitle = NSLocalizedStringWithDefaultValue(
+        @"SAFavoriteSchemaLoading.option.auto", nil, [NSBundle mainBundle],
+        @"Auto (load all)", @"Auto schema loading title");
+    NSString *lightTitle = NSLocalizedStringWithDefaultValue(
+        @"SAFavoriteSchemaLoading.option.light", nil, [NSBundle mainBundle],
+        @"Light (names only)", @"Light schema loading title");
+    NSString *manualTitle = NSLocalizedStringWithDefaultValue(
+        @"SAFavoriteSchemaLoading.option.manual", nil, [NSBundle mainBundle],
+        @"Manual (sync on demand)", @"Manual schema loading title");
+
+    NSArray<NSString *> *titles = @[autoTitle, lightTitle, manualTitle];
+    NSInteger tags[] = { SASchemaLoadingModeAuto, SASchemaLoadingModeLight, SASchemaLoadingModeManual };
+
+    typedef struct { __unsafe_unretained NSView *form;
+                     __unsafe_unretained NSPopUpButton *tz;
+                     NSPopUpButton * __strong *popupSlot;
+                     NSTextField  * __strong *labelSlot; } FormSetup;
+
+    FormSetup setups[] = {
+        { standardConnectionFormContainer, standardTimeZoneField,
+          &standardSchemaLoadingPopUp,    &standardSchemaLoadingLabel },
+        { socketConnectionFormContainer,   socketTimeZoneField,
+          &socketSchemaLoadingPopUp,      &socketSchemaLoadingLabel },
+        { sshConnectionFormContainer,      sshTimeZoneField,
+          &sshSchemaLoadingPopUp,         &sshSchemaLoadingLabel },
+        { awsIAMConnectionFormContainer,   awsIAMTimeZoneField,
+          &awsIAMSchemaLoadingPopUp,      &awsIAMSchemaLoadingLabel },
+        { vaultConnectionFormContainer,    vaultTimeZoneField,
+          &vaultSchemaLoadingPopUp,       &vaultSchemaLoadingLabel },
+    };
+
+    for (NSUInteger i = 0; i < sizeof(setups)/sizeof(setups[0]); i++) {
+        NSView *form = setups[i].form;
+        NSPopUpButton *tz = setups[i].tz;
+        if (!form || !tz) continue;
+
+        CGFloat anchorY = tz.frame.origin.y;
+
+        // Snapshot every existing subview's frame BEFORE resizing the form.
+        // Once we call -setFrame: on the form, AppKit's autoresize machinery
+        // will re-layout subviews according to their `flexibleMinY` mask
+        // (bottom margin flexes when superview height changes), shifting all
+        // of them up by 28pt. We don't want that — we want explicit control
+        // over which controls move and which stay put. We capture the
+        // originals here so we can restore them after the setFrame call.
+        NSMapTable<NSView *, NSValue *> *origFrames =
+            [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsObjectPointerPersonality
+                                  valueOptions:NSPointerFunctionsStrongMemory];
+        for (NSView *sub in [form subviews]) {
+            [origFrames setObject:[NSValue valueWithRect:sub.frame] forKey:sub];
+        }
+
+        // Grow the form's own height by 28pt AND lower its origin by 28pt
+        // (within the tabViewItem.view coordinate system). The form's
+        // physical top edge does NOT move; the extra 28pt of vertical space
+        // accrues at the bottom of the form. Autoresize will try to bubble
+        // subview positions up by 28pt — we revert that below.
+        NSRect ff = form.frame;
+        ff.size.height += schemaRowShift;
+        ff.origin.y -= schemaRowShift;
+        [form setFrame:ff];
+
+        // Undo autoresize's automatic 28pt shift: every subview goes back to
+        // its pre-resize frame. Net effect: every existing subview's
+        // physical on-screen position moves DOWN by 28pt (because the form
+        // itself moved down by 28pt), but its position inside the form is
+        // unchanged.
+        for (NSView *sub in [form subviews]) {
+            NSValue *origValue = [origFrames objectForKey:sub];
+            if (origValue) [sub setFrame:[origValue rectValue]];
+        }
+
+        // Now shift Time Zone and everything above it up by 28pt inside the
+        // form. Their two 28pt deltas (form origin -28, subview y +28)
+        // cancel, so Time Zone and the input fields above it stay on screen
+        // exactly where they were. The Allow LOCAL_DATA_INFILE / Cleartext /
+        // Require SSL checkboxes (below Time Zone) were not shifted, so
+        // they sit 28pt lower on screen than before — but well above the
+        // Connect-button row.
+        for (NSView *sub in [form subviews]) {
+            if (sub.frame.origin.y >= anchorY) {
+                NSRect f = sub.frame;
+                f.origin.y += schemaRowShift;
+                [sub setFrame:f];
+            }
+        }
+
+        // Label at the freed strip (anchorY, where Time Zone used to sit).
+        NSTextField *label = [[NSTextField alloc] initWithFrame:NSMakeRect(labelXInset, anchorY + 5.0, labelWidth, 17.0)];
+        [label setBezeled:NO];
+        [label setDrawsBackground:NO];
+        [label setEditable:NO];
+        [label setSelectable:NO];
+        [label setAlignment:NSTextAlignmentRight];
+        [label setStringValue:labelText];
+        [label setAutoresizingMask:(NSViewMaxXMargin | NSViewMinYMargin)];
+        [form addSubview:label];
+        *setups[i].labelSlot = label;
+
+        // Popup right of the label, mirroring the Time Zone popup geometry.
+        NSPopUpButton *popup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(popupXOffset, anchorY, popupWidth, 25.0)];
+        [popup setBezelStyle:NSBezelStyleRounded];
+        [popup setAutoresizingMask:(NSViewMaxXMargin | NSViewMinYMargin)];
+        [popup setTarget:self];
+        [popup setAction:@selector(schemaLoadingPopUpChanged:)];
+        for (NSUInteger t = 0; t < titles.count; t++) {
+            [popup addItemWithTitle:titles[t]];
+            [[popup lastItem] setTag:tags[t]];
+        }
+        [popup selectItemWithTag:self.schemaLoadingMode];
+        [form addSubview:popup];
+        *setups[i].popupSlot = popup;
+    }
+
+    // No explicit resize call needed: each form's top edge stays put (height
+    // grew by 28 but origin lowered by 28), so the tab view chain still fits.
+    // The existing `resizeTabViewToConnectionType:` path continues to work
+    // because it measures form.frame.size.height (which now embeds the row)
+    // and adds the same `additionalFormHeight` magic number as before.
+}
+
+- (IBAction)schemaLoadingPopUpChanged:(id)sender
+{
+    if (![sender isKindOfClass:[NSPopUpButton class]]) return;
+    NSInteger newMode = [(NSPopUpButton *)sender selectedTag];
+    if (newMode < SASchemaLoadingModeAuto || newMode > SASchemaLoadingModeManual) {
+        newMode = SASchemaLoadingModeAuto;
+    }
+    [self setSchemaLoadingMode:newMode];
+
+    // Mirror Time Zone behaviour: keep all five popups in sync visually so
+    // switching connection-type tabs shows the same value.
+    NSArray<NSPopUpButton *> *all = @[
+        standardSchemaLoadingPopUp ?: [NSPopUpButton new],
+        socketSchemaLoadingPopUp   ?: [NSPopUpButton new],
+        sshSchemaLoadingPopUp      ?: [NSPopUpButton new],
+        awsIAMSchemaLoadingPopUp   ?: [NSPopUpButton new],
+        vaultSchemaLoadingPopUp    ?: [NSPopUpButton new],
+    ];
+    for (NSPopUpButton *p in all) {
+        if (p && p != sender && p.superview) {
+            [p selectItemWithTag:newMode];
+        }
+    }
+
+    [self _startEditingConnection];
+}
+
 - (NSArray<NSMenuItem *> *)generateTimeZoneMenuItems
 {
     NSArray<NSString *> *timeZoneIdentifiers = [NSTimeZone.knownTimeZoneNames sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];

@@ -378,7 +378,10 @@ NSString *SPFavoriteVaultPortKey                         = @"vaultPort";
 NSString *SPFavoriteVaultOIDCMountKey                    = @"vaultOIDCMount";
 NSString *SPFavoriteVaultCredentialsPathKey              = @"vaultCredentialsPath";
 
+NSString *SPFavoriteSchemaLoadingModeKey                 = @"schemaLoadingMode";
+
 NSString *SPConnectionFavoritesChangedNotification       = @"SPConnectionFavoritesChanged";
+NSString *SPDBTableListWasUpdatedNotification            = @"SPDBTableListWasUpdated";
 NSString *SPConnectionShownSocketHelp                    = @"SPConnectionShownSocketHelp";
 NSString *SPStaleBookmarksHelp                           = @"SPStaleBookmarksHelp";
 

@@ -129,12 +129,33 @@
 	BOOL isTableListFiltered;
 	BOOL tableListIsSelectable;
 	BOOL tableListContainsViews;
-	
+
 	SPCharsetCollationHelper *addTableCharsetHelper;
+
+	// Async refresh coordination
+	uint64_t _refreshGeneration;
+	dispatch_queue_t _refreshSerialQueue;
+	NSProgressIndicator *_schemaLoadingSpinner;
+
+	// Sidebar filter coordination — keeps the typing-responsive filter loop
+	// off the main thread for large table lists. `_filterGeneration` lets
+	// stale background results drop instead of swapping into the UI.
+	uint64_t _filterGeneration;
 }
 
 // IBAction methods
 - (IBAction)updateTables:(nullable id)sender;
+/// Async table-list refresh.
+/// Triggers the same work as `updateTables:` but invokes `completion` on the
+/// main thread after the successful (current-generation) swap. Any stale
+/// completion is dropped silently; the block is still invoked (so callers do
+/// not deadlock waiting on a discarded refresh).
+- (void)updateTables:(nullable id)sender completion:(nullable void (^)(void))completion;
+/// Invalidates any in-flight schema refresh so a slow background result cannot
+/// swap obsolete tables into the UI. Must be called on the main thread before
+/// any state change that would make a running introspection's result stale,
+/// e.g. before `[mySQLConnection selectDatabase:]`.
+- (void)bumpSchemaRefreshGeneration;
 - (IBAction)addTable:(nullable id)sender;
 - (IBAction)closeSheet:(nullable id)sender;
 - (IBAction)removeTable:(nullable id)sender;

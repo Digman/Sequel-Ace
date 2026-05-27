@@ -265,6 +265,12 @@
 @property (readonly, strong) SPSplitView *contentViewSplitter;
 @property (strong) IBOutlet NSButton *multipleLineEditingButton;
 
+/// Per-document schema loading mode (`SASchemaLoadingMode` raw value).
+/// Populated by `SAConnectionWindowController` / `SPConnectionController` fallback
+/// before `setConnection:` so that `SPTablesList` and `SPDatabaseStructure` can
+/// honor Light / Manual semantics on the first connect.
+@property (nonatomic, assign) NSInteger currentSchemaLoadingMode;
+
 - (instancetype)initWithWindowController:(SPWindowController *)windowController;
 
 - (SPHelpViewerClient *)helpViewerClient;

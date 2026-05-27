@@ -109,8 +109,12 @@ static NSString *SPNewTableCollation    = @"SPNewTableCollation";
 
 		addTableCharsetHelper = nil; //initialized in awakeFromNib
 		_SQLitePinnedTableManager = SQLitePinnedTableManager.sharedInstance;
+
+		_refreshGeneration = 0;
+		_refreshSerialQueue = dispatch_queue_create("com.sequel-ace.SPTablesList.refresh", DISPATCH_QUEUE_SERIAL);
+		_schemaLoadingSpinner = nil;
 	}
-	
+
 	return self;
 }
 
@@ -193,73 +197,202 @@ static NSString *SPNewTableCollation    = @"SPNewTableCollation";
  */
 - (IBAction)updateTables:(nullable id)sender
 {
+	[self updateTables:sender completion:nil];
+}
 
-    SPLog(@"updateTables, sender: %@", sender);
+- (void)updateTables:(nullable id)sender completion:(nullable void (^)(void))completion
+{
+	// Main-thread entry contract: any background caller (e.g. SPTableData reload
+	// after a missing-table query) trampolines back to the main thread before
+	// touching ivars or AppKit.
+	if (![NSThread isMainThread]) {
+		dispatch_async(dispatch_get_main_queue(), ^{
+			[self updateTables:sender completion:completion];
+		});
+		return;
+	}
 
-	SPMySQLResult *theResult;
-	NSString *previousSelectedTable = nil;
+	SPLog(@"updateTables, sender: %@", sender);
+
+	// Bump and capture the generation. Any state change that invalidates the
+	// running refresh must also bump (see `bumpSchemaRefreshGeneration`).
+	uint64_t myGen;
+	@synchronized (self) {
+		++_refreshGeneration;
+		myGen = _refreshGeneration;
+	}
+
+	SPMySQLConnection *capturedConn = mySQLConnection;
+	NSString *capturedDatabase = [[tableDocumentInstance database] copy];
+
+	if (!capturedConn) {
+		if (completion) completion();
+		return;
+	}
+
+	// Capture UI state that the completion needs to restore.
+	NSString *previousSelectedTable = selectedTableName ? [selectedTableName copy] : nil;
 	NSString *previousFilterString = nil;
 	BOOL previousTableListIsSelectable = tableListIsSelectable;
-	BOOL changeEncoding = ![[mySQLConnection encoding] hasPrefix:@"utf8"];
-
-	if (selectedTableName) previousSelectedTable = [[NSString alloc] initWithString:selectedTableName];
 
 	if (isTableListFiltered) {
-		previousFilterString = [[NSString alloc] initWithString:[listFilterField stringValue]];
+		previousFilterString = [[listFilterField stringValue] copy];
 		filteredTables = tables;
 		filteredTableTypes = tableTypes;
 		isTableListFiltered = NO;
-		[[self onMainThread] clearFilter];
+		[self clearFilter];
 	}
 	tableListContainsViews = NO;
 	tableListIsSelectable = YES;
 	[self deselectAllTables];
-
 	tableListIsSelectable = previousTableListIsSelectable;
-	SPMainQSync(^{
-		//this has to be executed en-block on the main queue, otherwise the table view might have a chance to access released memory before we tell it to throw away everything.
-		[self->tables removeAllObjects];
-		[self->tableTypes removeAllObjects];
-		[self->tablesListView reloadData];
-		// Force a visual refresh of the table list
-		[self->tablesListView setNeedsDisplay:YES];
-		[self->tablesListView displayIfNeeded];
+
+	// Clear current state under lock; UI calls in the same main-thread tick
+	// can rely on an empty backing array.
+	@synchronized (self) {
+		[tables removeAllObjects];
+		[tableTypes removeAllObjects];
+	}
+	[tablesListView reloadData];
+	[tablesListView setNeedsDisplay:YES];
+	[tablesListView displayIfNeeded];
+
+	if (!capturedDatabase) {
+		// No database selected — nothing to fetch.
+		if (completion) completion();
+		return;
+	}
+
+	[self _setSchemaSpinnerActive:YES];
+	[[NSNotificationCenter defaultCenter] postNotificationName:@"SMySQLQueryWillBePerformed" object:tableDocumentInstance];
+
+	dispatch_async(_refreshSerialQueue, ^{
+		[self _performIntrospectionForGeneration:myGen
+		                            capturedConn:capturedConn
+		                        capturedDatabase:capturedDatabase
+		                  previousSelectedTable:previousSelectedTable
+		                   previousFilterString:previousFilterString
+		          previousTableListIsSelectable:previousTableListIsSelectable
+		                                 sender:sender
+		                              completion:completion];
 	});
+}
 
-	if ([tableDocumentInstance database]) {
+- (void)bumpSchemaRefreshGeneration
+{
+	// Must execute synchronously — callers (e.g. SPDatabaseDocument
+	// -selectMySQLDatabase:) rely on the bump being observable before the
+	// next state change (the actual database switch). Background callers
+	// previously got an async hop, which let `[mySQLConnection selectDatabase:]`
+	// race ahead and leave a slow refresh still passing the generation check.
+	// Use the same lock that protects reads/writes of `_refreshGeneration`
+	// elsewhere so cross-thread visibility is well-defined.
+	@synchronized (self) {
+		++_refreshGeneration;
+	}
+}
 
-		// Notify listeners that a query has started
-		[[NSNotificationCenter defaultCenter] postNotificationOnMainThreadWithName:@"SMySQLQueryWillBePerformed" object:tableDocumentInstance];
+- (void)_performIntrospectionForGeneration:(uint64_t)myGen
+                              capturedConn:(SPMySQLConnection *)capturedConn
+                          capturedDatabase:(NSString *)capturedDatabase
+                     previousSelectedTable:(NSString *)previousSelectedTable
+                      previousFilterString:(NSString *)previousFilterString
+             previousTableListIsSelectable:(BOOL)previousTableListIsSelectable
+                                    sender:(id)sender
+                                completion:(void (^)(void))completion
+{
+	NSMutableArray *localTables = [NSMutableArray array];
+	NSMutableArray *localTableTypes = [NSMutableArray array];
+	NSMutableDictionary *localComments = [NSMutableDictionary dictionary];
+	BOOL localContainsViews = NO;
+	BOOL fetchSucceeded = NO;
+	BOOL didFallback = NO;
 
-		// Use UTF8 for identifier-based queries
-		if (changeEncoding) {
-			[mySQLConnection storeEncodingForRestoration];
-			[mySQLConnection setEncoding:@"utf8mb4"];
-		}
-
-		// Select the table list for the current database.  On MySQL versions after 5 this will include
-		// views; on MySQL versions >= 5.0.02 select the "full" list to also select the table type column.
-		if ([prefs boolForKey:SPDisplayCommentsInTablesList]) {
-			theResult = [mySQLConnection queryString:@"SHOW TABLE STATUS"];
+	SPMySQLConnection *clone = nil;
+	@try {
+		clone = [self _makeIntrospectionConnectionForDatabase:capturedDatabase];
+		if (clone) {
+			// Clone path — does not block the shared main connection.
+			fetchSucceeded = [self _fetchTablesIntoArray:localTables
+			                                       types:localTableTypes
+			                                    comments:localComments
+			                              containsViews:&localContainsViews
+			                                onConnection:clone
+			                            forDatabaseName:capturedDatabase];
 		} else {
-			theResult = [mySQLConnection queryString:@"SHOW FULL TABLES"];
+			// Fallback: clone unavailable (e.g. SSH tunnel down). Run on the
+			// shared main connection — degraded but matches pre-feature behavior.
+			didFallback = YES;
+			fetchSucceeded = [self _fetchTablesIntoArray:localTables
+			                                       types:localTableTypes
+			                                    comments:localComments
+			                              containsViews:&localContainsViews
+			                                onConnection:capturedConn
+			                            forDatabaseName:capturedDatabase];
 		}
+	} @catch (NSException *ex) {
+		SPLog(@"Schema introspection exception: %@", ex);
+		fetchSucceeded = NO;
+	} @finally {
+		[self _disposeIntrospectionConnection:clone];
+	}
+
+	dispatch_async(dispatch_get_main_queue(), ^{
+		[self _completeIntrospectionForGeneration:myGen
+		                            capturedConn:capturedConn
+		                        capturedDatabase:capturedDatabase
+		                              localTables:localTables
+		                          localTableTypes:localTableTypes
+		                            localComments:localComments
+		                       localContainsViews:localContainsViews
+		                            fetchSucceeded:fetchSucceeded
+		                              didFallback:didFallback
+		                   previousSelectedTable:previousSelectedTable
+		                    previousFilterString:previousFilterString
+		           previousTableListIsSelectable:previousTableListIsSelectable
+		                                   sender:sender
+		                                completion:completion];
+	});
+}
+
+- (BOOL)_fetchTablesIntoArray:(NSMutableArray *)outTables
+                        types:(NSMutableArray *)outTypes
+                     comments:(NSMutableDictionary *)outComments
+                containsViews:(BOOL *)outContainsViews
+                  onConnection:(SPMySQLConnection *)conn
+              forDatabaseName:(NSString *)databaseName
+{
+	if (!conn || !databaseName) return NO;
+
+	BOOL changeEncoding = ![[conn encoding] hasPrefix:@"utf8"];
+	if (changeEncoding) {
+		[conn storeEncodingForRestoration];
+		[conn setEncoding:@"utf8mb4"];
+	}
+
+	@try {
+		SPMySQLResult *theResult = nil;
+		if ([prefs boolForKey:SPDisplayCommentsInTablesList]) {
+			theResult = [conn queryString:@"SHOW TABLE STATUS"];
+		} else {
+			theResult = [conn queryString:@"SHOW FULL TABLES"];
+		}
+		if (!theResult || [conn queryErrored]) return NO;
+
 		[theResult setDefaultRowReturnType:SPMySQLResultRowAsDictionary];
-		[theResult setReturnDataAsStrings:YES]; // TODO: workaround for bug #2700 (#2699)
+		[theResult setReturnDataAsStrings:YES];
+
 		if ([theResult numberOfFields] == 1 && [[theResult getRow] isKindOfClass:[NSArray class]]) {
 			for (NSArray *eachRow in theResult) {
-				[tables addObject:[eachRow objectAtIndex:0]];
-				[tableTypes addObject:[NSNumber numberWithInteger:SPTableTypeTable]];
+				[outTables addObject:[eachRow objectAtIndex:0]];
+				[outTypes addObject:@(SPTableTypeTable)];
 			}
 		} else {
 			for (NSDictionary *eachRow in theResult) {
-
 				NSMutableDictionary *mutableRow = [eachRow mutableCopy];
 				NSString *tableType = [mutableRow objectForKey:@"Table_type"];
 				[mutableRow removeObjectForKey:@"Table_type"];
 
-				// Due to encoding problems it can be the case that [resultRow objectAtIndex:0]
-				// return NSNull, thus catch that case for safety reasons
 				id tableName = [mutableRow objectForKey:@"Name"];
 				if (tableName == nil || [tableName isNSNull]) {
 					tableName = [mutableRow objectForKey:@"NAME"];
@@ -270,9 +403,8 @@ static NSString *SPNewTableCollation    = @"SPNewTableCollation";
 				if (tableName == nil || [tableName isNSNull]) {
 					tableName = @"...";
 				}
-				[tables addObject:tableName];
-				
-				// comments is usefull
+				[outTables addObject:tableName];
+
 				id tableComment = [mutableRow objectForKey:@"Comment"];
 				if (tableComment == nil || [tableComment isNSNull]) {
 					tableComment = [mutableRow objectForKey:@"COMMENT"];
@@ -280,119 +412,228 @@ static NSString *SPNewTableCollation    = @"SPNewTableCollation";
 				if (tableComment == nil || [tableComment isNSNull]) {
 					tableComment = @"";
 				}
-				[tableComments setValue:tableComment forKey:tableName];
+				[outComments setValue:tableComment forKey:tableName];
 
 				if ([@"VIEW" isEqualToString:tableComment] || [@"VIEW" isEqualToString:tableType]) {
-					[tableTypes addObject:[NSNumber numberWithInteger:SPTableTypeView]];
-					tableListContainsViews = YES;
+					[outTypes addObject:@(SPTableTypeView)];
+					if (outContainsViews) *outContainsViews = YES;
 				} else {
-					[tableTypes addObject:[NSNumber numberWithInteger:SPTableTypeTable]];
+					[outTypes addObject:@(SPTableTypeTable)];
 				}
 			}
 		}
 
-		/* Grab the procedures and functions
-		 *
-		 * Using information_schema gives us more info (for information window perhaps?) but breaks
-		 * backward compatibility with pre 4 I believe. I left the other methods below, in case.
-		 */
-        NSString *pQuery = [NSString stringWithFormat:@"SELECT * FROM information_schema.routines WHERE routine_schema = %@ ORDER BY routine_name", [[tableDocumentInstance database] tickQuotedString]];
-        theResult = [mySQLConnection queryString:pQuery];
-        [theResult setDefaultRowReturnType:SPMySQLResultRowAsArray];
-        [theResult setReturnDataAsStrings:YES]; //see tables above
-        
-        // Check for mysql errors - if information_schema is not accessible for some reasons
-        // omit adding procedures and functions
-        if(![mySQLConnection queryErrored] && theResult != nil && [theResult numberOfRows] && [theResult numberOfFields] > 3) {
+		NSString *pQuery = [NSString stringWithFormat:@"SELECT * FROM information_schema.routines WHERE routine_schema = %@ ORDER BY routine_name", [databaseName tickQuotedString]];
+		theResult = [conn queryString:pQuery];
+		[theResult setDefaultRowReturnType:SPMySQLResultRowAsArray];
+		[theResult setReturnDataAsStrings:YES];
 
-            // Add the header row
-            [tables addObject:NSLocalizedString(@"PROCS & FUNCS",@"header for procs & funcs list")];
-            [tableTypes addObject:[NSNumber numberWithInteger:SPTableTypeNone]];
+		if (![conn queryErrored] && theResult != nil && [theResult numberOfRows] && [theResult numberOfFields] > 3) {
+			[outTables addObject:NSLocalizedString(@"PROCS & FUNCS", @"header for procs & funcs list")];
+			[outTypes addObject:@(SPTableTypeNone)];
 
-            for (NSArray *eachRow in theResult) {
-                [tables addObject:[eachRow safeObjectAtIndex:3]];
-                if([[eachRow safeObjectAtIndex:4] isNSNull] == NO ){
-                    if ([[eachRow safeObjectAtIndex:4] isEqualToString:@"PROCEDURE"]) {
-                        [tableTypes addObject:[NSNumber numberWithInteger:SPTableTypeProc]];
-                    } else {
-                        [tableTypes addObject:[NSNumber numberWithInteger:SPTableTypeFunc]];
-                    }
-                }
-            }
-        }
-
-		// Restore encoding if appropriate
-		if (changeEncoding) [mySQLConnection restoreStoredEncoding];
-
-		// Notify listeners that the query has finished
-		[[NSNotificationCenter defaultCenter] postNotificationOnMainThreadWithName:@"SMySQLQueryHasBeenPerformed" object:tableDocumentInstance];
-	}
-
-	// Add the table headers even if no tables were found
-	if (tableListContainsViews) {
-		[tables insertObject:NSLocalizedString(@"TABLES & VIEWS",@"header for table & views list") atIndex:0];
-	} 
-	else {
-		[tables insertObject:NSLocalizedString(@"TABLES",@"header for table list") atIndex:0];
-	}
-	
-	[tableTypes insertObject:[NSNumber numberWithInteger:SPTableTypeNone] atIndex:0];
-
-	[[tablesListView onMainThread] reloadData];
-
-	// if the previous selected table still exists, select it
-	// but not if the update was called from SPTableData since it calls that method
-	// if a selected table doesn't exist - this happens if a table was deleted/renamed by an other user
-	// or if the table name contains characters which are not supported by the current set encoding
-	if ( ![sender isKindOfClass:[SPTableData class]] && previousSelectedTable != nil && [tables indexOfObject:previousSelectedTable] < [tables count]) {
-		NSInteger itemToReselect = [tables indexOfObject:previousSelectedTable];
-		tableListIsSelectable = YES;
-		[[tablesListView onMainThread] selectRowIndexes:[NSIndexSet indexSetWithIndex:itemToReselect] byExtendingSelection:NO];
-		tableListIsSelectable = previousTableListIsSelectable;
-		selectedTableName = [[NSString alloc] initWithString:[tables objectAtIndex:itemToReselect]];
-		selectedTableType = (SPTableType)[[tableTypes objectAtIndex:itemToReselect] integerValue];
-	}
-    else if (selectedTableName != nil) {
-        selectedTableName = nil;
-        [[tablesListView onMainThread] selectRowIndexes:[NSIndexSet init] byExtendingSelection:NO];
-        selectedTableType = SPTableTypeNone;
-    }
-    
-    [self refreshPinnedTables];
-
-	// Determine whether or not to preserve the existing filter, and whether to
-	// show or hide the list filter based on the number of tables
-	if ([tables count] > 20) {
-		[self showFilter];
-		if (previousFilterString) {
-			[[listFilterField onMainThread] setStringValue:previousFilterString];
-			[[self onMainThread] updateFilter:self];
+			for (NSArray *eachRow in theResult) {
+				[outTables addObject:[eachRow safeObjectAtIndex:3]];
+				if ([[eachRow safeObjectAtIndex:4] isNSNull] == NO) {
+					if ([[eachRow safeObjectAtIndex:4] isEqualToString:@"PROCEDURE"]) {
+						[outTypes addObject:@(SPTableTypeProc)];
+					} else {
+						[outTypes addObject:@(SPTableTypeFunc)];
+					}
+				}
+			}
 		}
-	} else {
-		[self hideFilter];
+
+		return YES;
+	} @finally {
+		if (changeEncoding) {
+			@try { [conn restoreStoredEncoding]; } @catch (NSException *_) {}
+		}
+	}
+}
+
+- (void)_completeIntrospectionForGeneration:(uint64_t)myGen
+                                capturedConn:(SPMySQLConnection *)capturedConn
+                            capturedDatabase:(NSString *)capturedDatabase
+                                  localTables:(NSMutableArray *)localTables
+                              localTableTypes:(NSMutableArray *)localTableTypes
+                                localComments:(NSMutableDictionary *)localComments
+                           localContainsViews:(BOOL)localContainsViews
+                               fetchSucceeded:(BOOL)fetchSucceeded
+                                  didFallback:(BOOL)didFallback
+                       previousSelectedTable:(NSString *)previousSelectedTable
+                        previousFilterString:(NSString *)previousFilterString
+              previousTableListIsSelectable:(BOOL)previousTableListIsSelectable
+                                       sender:(id)sender
+                                   completion:(void (^)(void))completion
+{
+	// Stale generation: a newer refresh owns the spinner; do not stop it.
+	uint64_t currentGen;
+	@synchronized (self) {
+		currentGen = _refreshGeneration;
+	}
+	if (myGen != currentGen) {
+		if (completion) completion();
+		return;
 	}
 
-	// Set the filter placeholder text
-	if ([tableDocumentInstance database]) {
-		SPMainQSync(^{
-			// -cell is a UI call according to Xcode 9.2 (and -setPlaceholderString: is too, obviously)
-			[[self->listFilterField cell] setPlaceholderString:NSLocalizedString(@"Filter", @"filter label")];
+	// Identity check — under invariant, a connection/db swap must have bumped
+	// generation already, so reaching here with mismatch is defensive only.
+	if (capturedConn != mySQLConnection ||
+		![capturedDatabase isEqualToString:[tableDocumentInstance database]]) {
+		[self _setSchemaSpinnerActive:NO];
+		if (completion) completion();
+		return;
+	}
+
+	if (fetchSucceeded) {
+		@synchronized (self) {
+			[tables setArray:localTables];
+			[tableTypes setArray:localTableTypes];
+			[tableComments setDictionary:localComments];
+			tableListContainsViews = localContainsViews;
+
+			if (tableListContainsViews) {
+				[tables insertObject:NSLocalizedString(@"TABLES & VIEWS", @"header for table & views list") atIndex:0];
+			} else {
+				[tables insertObject:NSLocalizedString(@"TABLES", @"header for table list") atIndex:0];
+			}
+			[tableTypes insertObject:@(SPTableTypeNone) atIndex:0];
+		}
+
+		[tablesListView reloadData];
+
+		if (![sender isKindOfClass:[SPTableData class]] && previousSelectedTable != nil && [tables indexOfObject:previousSelectedTable] < [tables count]) {
+			NSInteger itemToReselect = [tables indexOfObject:previousSelectedTable];
+			tableListIsSelectable = YES;
+			[tablesListView selectRowIndexes:[NSIndexSet indexSetWithIndex:itemToReselect] byExtendingSelection:NO];
+			tableListIsSelectable = previousTableListIsSelectable;
+			selectedTableName = [[NSString alloc] initWithString:[tables objectAtIndex:itemToReselect]];
+			selectedTableType = (SPTableType)[[tableTypes objectAtIndex:itemToReselect] integerValue];
+		} else if (selectedTableName != nil) {
+			selectedTableName = nil;
+			[tablesListView selectRowIndexes:[NSIndexSet indexSet] byExtendingSelection:NO];
+			selectedTableType = SPTableTypeNone;
+		}
+
+		[self refreshPinnedTables];
+
+		if ([tables count] > 20) {
+			[self showFilter];
+			if (previousFilterString) {
+				[listFilterField setStringValue:previousFilterString];
+				[self updateFilter:self];
+			}
+		} else {
+			[self hideFilter];
+		}
+
+		if ([tableDocumentInstance database]) {
+			[[listFilterField cell] setPlaceholderString:NSLocalizedString(@"Filter", @"filter label")];
+		}
+
+		[self subscribeToTablePinningNotifications];
+	}
+
+	[self _setSchemaSpinnerActive:NO];
+	[[NSNotificationCenter defaultCenter] postNotificationName:@"SMySQLQueryHasBeenPerformed" object:tableDocumentInstance];
+	[[NSNotificationCenter defaultCenter] postNotificationName:SPDBTableListWasUpdatedNotification object:tableDocumentInstance];
+
+	if (fetchSucceeded) {
+		// Always chain structure retrieval. SPDatabaseStructure enforces the
+		// Light/Manual implicit-skip and respects the explicit `forceUpdate`
+		// flag, so any user-driven refresh (sender != self) reaches the
+		// fan-out regardless of mode. The implicit setConnection path goes
+		// through Manual gate earlier and never lands here.
+		if (sender == self) {
+			[[tableDocumentInstance databaseStructureRetrieval] queryDbStructureInBackgroundWithUserInfo:nil];
+		} else {
+			[[tableDocumentInstance databaseStructureRetrieval] queryDbStructureInBackgroundWithUserInfo:@{@"forceUpdate": @YES, @"cancelQuerying": @YES}];
+		}
+	}
+
+	if (completion) completion();
+}
+
+#pragma mark - Schema introspection helpers
+
+- (nullable SPMySQLConnection *)_makeIntrospectionConnectionForDatabase:(NSString *)databaseName
+{
+	if (!mySQLConnection || ![mySQLConnection isConnected] || !databaseName) return nil;
+
+	SPMySQLConnection *clone = [mySQLConnection copy];
+	if (!clone) return nil;
+
+	// Use the document as delegate so keychain/no-connection/lost-connection
+	// callbacks are handled by the same code path as the main connection.
+	[clone setDelegate:tableDocumentInstance];
+	// Sync the live local port from the parent connection — SSH tunnel local
+	// ports may have shifted since the connection was first opened.
+	[clone setPort:[mySQLConnection port]];
+
+	if (![clone connect]) {
+		@try { [clone disconnect]; } @catch (NSException *_) {}
+		return nil;
+	}
+	[clone setEncoding:@"utf8mb4"];
+	if (![clone selectDatabase:databaseName]) {
+		@try { [clone disconnect]; } @catch (NSException *_) {}
+		return nil;
+	}
+	return clone;
+}
+
+- (void)_disposeIntrospectionConnection:(nullable SPMySQLConnection *)clone
+{
+	if (!clone) return;
+	@try {
+		if ([clone isConnected]) [clone disconnect];
+	} @catch (NSException *_) {
+		// Clone is one-shot per refresh; ignore disconnect errors.
+	}
+}
+
+- (void)_setSchemaSpinnerActive:(BOOL)active
+{
+	if (![NSThread isMainThread]) {
+		dispatch_async(dispatch_get_main_queue(), ^{
+			[self _setSchemaSpinnerActive:active];
 		});
+		return;
 	}
 
-	if (previousSelectedTable) previousSelectedTable = nil;
-	if (previousFilterString) previousFilterString = nil;
-	
-	// Query the structure of all databases in the background
-	if (sender == self)
-		// Invoked by SP
-		[[tableDocumentInstance databaseStructureRetrieval] queryDbStructureInBackgroundWithUserInfo:nil];
-	else
-		// User press refresh button ergo force update
-		[[tableDocumentInstance databaseStructureRetrieval] queryDbStructureInBackgroundWithUserInfo:@{@"forceUpdate" : @YES, @"cancelQuerying" : @YES}];
-    
-    [self subscribeToTablePinningNotifications];
-
+	if (active) {
+		if (!_schemaLoadingSpinner) {
+			NSView *host = tablesListView ? [tablesListView superview] : nil;
+			const CGFloat spinnerSize = 32.0;
+			NSProgressIndicator *spinner = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(0, 0, spinnerSize, spinnerSize)];
+			[spinner setStyle:NSProgressIndicatorStyleSpinning];
+			[spinner setControlSize:NSControlSizeRegular];
+			[spinner setUsesThreadedAnimation:YES];
+			[spinner setDisplayedWhenStopped:NO];
+			[spinner setHidden:YES];
+			if (host) {
+				NSRect hostBounds = [host bounds];
+				// Center the spinner in the sidebar so the user gets a clear
+				// "loading" signal — especially in Manual mode where the
+				// sidebar is otherwise empty until the user triggers a
+				// refresh. All four margins flex so the spinner stays
+				// centered if the host view resizes.
+				NSRect spinnerFrame = NSMakeRect((NSWidth(hostBounds) - spinnerSize) / 2.0,
+				                                  (NSHeight(hostBounds) - spinnerSize) / 2.0,
+				                                  spinnerSize, spinnerSize);
+				[spinner setFrame:spinnerFrame];
+				[spinner setAutoresizingMask:(NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin | NSViewMaxYMargin)];
+				[host addSubview:spinner positioned:NSWindowAbove relativeTo:nil];
+			}
+			_schemaLoadingSpinner = spinner;
+		}
+		[_schemaLoadingSpinner setHidden:NO];
+		[_schemaLoadingSpinner startAnimation:nil];
+	} else {
+		[_schemaLoadingSpinner stopAnimation:nil];
+		[_schemaLoadingSpinner setHidden:YES];
+	}
 }
 
 /**
@@ -841,8 +1082,20 @@ static NSString *SPNewTableCollation    = @"SPNewTableCollation";
  */
 - (void)setConnection:(SPMySQLConnection *)theConnection
 {
+	// Invariant: bump generation before assigning the connection, so any
+	// in-flight introspection against the previous connection drops cleanly.
+	[self bumpSchemaRefreshGeneration];
 	mySQLConnection = theConnection;
-	
+
+	// Manual mode skips the implicit initial fetch; the sidebar stays empty
+	// until the user requests an explicit refresh. The user can still trigger
+	// `updateTables:` via the sidebar Refresh button or toolbar action.
+	NSInteger mode = [tableDocumentInstance currentSchemaLoadingMode];
+	if (mode == SASchemaLoadingModeManual) {
+		[[NSNotificationCenter defaultCenter] postNotificationName:SPDBTableListWasUpdatedNotification object:tableDocumentInstance];
+		return;
+	}
+
 	[self updateTables:self];
 }
 
@@ -1346,19 +1599,25 @@ static NSString *SPNewTableCollation    = @"SPNewTableCollation";
 }
 
 /**
- * Database tables accessor
+ * Database tables accessor. Returns an immutable snapshot so callers cannot
+ * see partial state while async refresh is swapping the backing array, and
+ * cannot mutate internal state by accident.
  */
 - (NSArray *)tables
 {
-	return tables;
+	@synchronized (self) {
+		return [tables copy];
+	}
 }
 
 /**
- * Database tables accessor
+ * Pinned tables accessor — immutable snapshot for the same reason as `-tables`.
  */
 - (NSArray *)pinnedTables
 {
-    return pinnedTables;
+	@synchronized (self) {
+		return [pinnedTables copy];
+	}
 }
 
 /**
@@ -1446,11 +1705,14 @@ static NSString *SPNewTableCollation    = @"SPNewTableCollation";
 }
 
 /**
- * Database table types accessor
+ * Database table types accessor — immutable snapshot for the same reason as
+ * `-tables`.
  */
 - (NSArray *)tableTypes
 {
-	return tableTypes;
+	@synchronized (self) {
+		return [tableTypes copy];
+	}
 }
 
 /**
@@ -2244,100 +2506,325 @@ static NSString *SPNewTableCollation    = @"SPNewTableCollation";
  */
 - (IBAction)updateFilter:(id)sender
 {
-	// Don't try and maintain selections of multiple rows through filtering
+	// Routing:
+	//   • NSSearchField / NSTextField sender = the user is typing in the
+	//     sidebar filter. Debounce 180 ms, then run the heavy loop on a
+	//     background queue so AppKit can keep painting characters.
+	//   • Programmatic sender (self / nil / updateTables completion etc.)
+	//     runs the filter synchronously so callers that immediately read
+	//     `filteredTables` see fresh data.
+	if ([sender isKindOfClass:[NSSearchField class]] || [sender isKindOfClass:[NSTextField class]]) {
+		[NSObject cancelPreviousPerformRequestsWithTarget:self
+		                                         selector:@selector(_performFilterUpdate)
+		                                           object:nil];
+		[self performSelector:@selector(_performFilterUpdate) withObject:nil afterDelay:0.18];
+		return;
+	}
+	[self _performFilterUpdateSync];
+}
+
+- (void)_performFilterUpdateSync
+{
+	// Synchronous filter — used by programmatic callers that need fresh
+	// `filteredTables` immediately after the call returns. Identical to the
+	// pre-async filter body; safe to run on main thread for moderate sizes,
+	// expected to be called only on connect/reload, not on every keystroke.
+
+	// Bump the filter generation so any in-flight async filter block from a
+	// prior keystroke cannot complete after us and overwrite this sync swap
+	// with a stale result.
+	@synchronized (self) {
+		++_filterGeneration;
+	}
+
 	if ([tablesListView numberOfSelectedRows] > 1) {
 		[self deselectAllTables];
-
 		if (selectedTableName) selectedTableName = nil;
 	}
 
 	if ([[listFilterField stringValue] length]) {
-		filteredTables = [[NSMutableArray alloc] init];
-		filteredTableTypes = [[NSMutableArray alloc] init];
+		NSMutableArray *result = [[NSMutableArray alloc] init];
+		NSMutableArray *resultTypes = [[NSMutableArray alloc] init];
 
-		NSUInteger i;
 		NSInteger lastTableType = NSNotFound, tableType;
 		NSRange substringRange;
 		NSString *filterString = [listFilterField stringValue];
-		BOOL isPinnedTablesSection = 0;
-        NSString * pinnedHeader = NSLocalizedString(@"PINNED", @"header for pinned tables");
-		for (i = 0; i < [tables count]; i++) {
-			tableType = [[tableTypes objectAtIndex:i] integerValue];
+		BOOL isPinnedTablesSection = NO;
+		NSString *pinnedHeader = NSLocalizedString(@"PINNED", @"header for pinned tables");
+		const NSUInteger matchLimit = 500;
+		NSUInteger matchCount = 0;
+		NSUInteger truncatedCount = 0;
+
+		NSArray *snapshotTables;
+		NSArray *snapshotTypes;
+		@synchronized (self) {
+			snapshotTables = [tables copy];
+			snapshotTypes = [tableTypes copy];
+		}
+
+		for (NSUInteger i = 0; i < [snapshotTables count]; i++) {
+			tableType = (i < snapshotTypes.count)
+			            ? [[snapshotTypes objectAtIndex:i] integerValue]
+			            : SPTableTypeNone;
+			id name = [snapshotTables objectAtIndex:i];
 			if (tableType == SPTableTypeNone) {
-				if ([tables[i] isEqualTo:pinnedHeader]) { // pinned tables start
-					isPinnedTablesSection = 1;
-					[filteredTables addObject:pinnedHeader];
-					[filteredTableTypes addObject:@(SPTableTypeNone)];
-				}
-				else { // pinned tables end
-					isPinnedTablesSection = 0;
+				if ([name isKindOfClass:[NSString class]] && [(NSString *)name isEqualToString:pinnedHeader]) {
+					isPinnedTablesSection = YES;
+					[result addObject:pinnedHeader];
+					[resultTypes addObject:@(SPTableTypeNone)];
+				} else {
+					isPinnedTablesSection = NO;
 				}
 				continue;
 			}
+
+			if (![name isKindOfClass:[NSString class]]) continue;
 
 			if (isPinnedTablesSection) {
-				[filteredTables addObject:[tables objectAtIndex:i]];
-				[filteredTableTypes addObject:[tableTypes objectAtIndex:i]];
+				[result addObject:name];
+				[resultTypes addObject:@(tableType)];
 				continue;
 			}
 
-			// First check the table name against the string as a regex, falling back to direct string match
-			if (![[tables objectAtIndex:i] isMatchedByRegex:filterString]) {
-				substringRange = [[tables objectAtIndex:i] rangeOfString:filterString options:NSCaseInsensitiveSearch];
-				if (substringRange.location == NSNotFound) continue;
-			}
+			substringRange = [(NSString *)name rangeOfString:filterString options:NSCaseInsensitiveSearch];
+			if (substringRange.location == NSNotFound) continue;
 
-			// Add a title if necessary
-			if ((tableType == SPTableTypeTable || tableType == SPTableTypeView) && lastTableType == NSNotFound)
-			{
+			if (matchCount >= matchLimit) {
+				truncatedCount++;
+				continue;
+			}
+			matchCount++;
+
+			if ((tableType == SPTableTypeTable || tableType == SPTableTypeView) && lastTableType == NSNotFound) {
 				if (tableListContainsViews) {
-					[filteredTables addObject:NSLocalizedString(@"TABLES & VIEWS",@"header for table & views list")];
+					[result addObject:NSLocalizedString(@"TABLES & VIEWS", @"header for table & views list")];
 				} else {
-					[filteredTables addObject:NSLocalizedString(@"TABLES",@"header for table list")];
+					[result addObject:NSLocalizedString(@"TABLES", @"header for table list")];
 				}
-				[filteredTableTypes addObject:[NSNumber numberWithInteger:SPTableTypeNone]];
+				[resultTypes addObject:@(SPTableTypeNone)];
 			} else if ((tableType == SPTableTypeProc || tableType == SPTableTypeFunc)
-						&& (lastTableType == NSNotFound || lastTableType == SPTableTypeTable || lastTableType == SPTableTypeView))
-			{
-				[filteredTables addObject:NSLocalizedString(@"PROCS & FUNCS",@"header for procs & funcs list")];
-				[filteredTableTypes addObject:[NSNumber numberWithInteger:SPTableTypeNone]];
+				   && (lastTableType == NSNotFound || lastTableType == SPTableTypeTable || lastTableType == SPTableTypeView)) {
+				[result addObject:NSLocalizedString(@"PROCS & FUNCS", @"header for procs & funcs list")];
+				[resultTypes addObject:@(SPTableTypeNone)];
 			}
 			lastTableType = tableType;
-
-			// Add the item
-			[filteredTables addObject:[tables objectAtIndex:i]];
-			[filteredTableTypes addObject:[tableTypes objectAtIndex:i]];
+			[result addObject:name];
+			[resultTypes addObject:@(tableType)];
 		}
 
-		// Add a "no matches" title if nothing matches the current filter settings
-		if (![filteredTables count]) {
-			[filteredTables addObject:NSLocalizedString(@"NO MATCHES",@"header for no matches in filtered list")];
-			[filteredTableTypes addObject:[NSNumber numberWithInteger:SPTableTypeNone]];
+		if (![result count]) {
+			[result addObject:NSLocalizedString(@"NO MATCHES", @"header for no matches in filtered list")];
+			[resultTypes addObject:@(SPTableTypeNone)];
 		}
 
-		// If the currently selected table isn't present in the filter list, add it as a special entry
-		if (selectedTableName && [filteredTables indexOfObject:selectedTableName] == NSNotFound) {
-			[filteredTables addObject:NSLocalizedString(@"CURRENT SELECTION",@"header for current selection in filtered list")];
-			[filteredTableTypes addObject:[NSNumber numberWithInteger:SPTableTypeNone]];
-			[filteredTables addObject:selectedTableName];
-			[filteredTableTypes addObject:[NSNumber numberWithInteger:selectedTableType]];
+		if (truncatedCount > 0) {
+			NSString *fmt = NSLocalizedStringWithDefaultValue(
+				@"SATablesList.filterTruncated", nil, [NSBundle mainBundle],
+				@"… %lu more matches (keep typing to narrow)",
+				@"footer shown when the sidebar filter result was truncated");
+			[result addObject:[NSString stringWithFormat:fmt, (unsigned long)truncatedCount]];
+			[resultTypes addObject:@(SPTableTypeNone)];
 		}
 
+		if (selectedTableName && [result indexOfObject:selectedTableName] == NSNotFound) {
+			[result addObject:NSLocalizedString(@"CURRENT SELECTION", @"header for current selection in filtered list")];
+			[resultTypes addObject:@(SPTableTypeNone)];
+			[result addObject:selectedTableName];
+			[resultTypes addObject:@(selectedTableType)];
+		}
+
+		@synchronized (self) {
+			filteredTables = result;
+			filteredTableTypes = resultTypes;
+		}
 		isTableListFiltered = YES;
-	} 
-	else if (isTableListFiltered) {
+	} else if (isTableListFiltered) {
 		isTableListFiltered = NO;
-		filteredTables = tables;
-		filteredTableTypes = tableTypes;
+		@synchronized (self) {
+			filteredTables = tables;
+			filteredTableTypes = tableTypes;
+		}
 	}
 
-	// Reselect correct row and reload the table view display
 	if ([tablesListView numberOfRows] < (NSInteger)[filteredTables count]) [tablesListView noteNumberOfRowsChanged];
-
-    if (selectedTableName && [filteredTables indexOfObject:selectedTableName] < NSNotFound){
-        [tablesListView selectRowIndexes:[NSIndexSet indexSetWithIndex:[filteredTables indexOfObject:selectedTableName]] byExtendingSelection:NO];
-    }
+	if (selectedTableName && [filteredTables indexOfObject:selectedTableName] < NSNotFound) {
+		[tablesListView selectRowIndexes:[NSIndexSet indexSetWithIndex:[filteredTables indexOfObject:selectedTableName]] byExtendingSelection:NO];
+	}
 	[tablesListView reloadData];
+}
+
+- (void)_performFilterUpdate
+{
+	// Main-thread coordinator. Snapshots the inputs, then dispatches the heavy
+	// loop to a concurrent background queue. The main thread only swaps the
+	// resulting arrays back into the table view, so the UI stays responsive
+	// while the user keeps typing — even with tens of thousands of tables.
+	if (![NSThread isMainThread]) {
+		dispatch_async(dispatch_get_main_queue(), ^{ [self _performFilterUpdate]; });
+		return;
+	}
+
+	if ([tablesListView numberOfSelectedRows] > 1) {
+		[self deselectAllTables];
+		if (selectedTableName) selectedTableName = nil;
+	}
+
+	NSString *filterString = [[listFilterField stringValue] copy];
+
+	// Always bump the generation up-front. Any change in filter state —
+	// including clearing the field — must invalidate prior in-flight async
+	// filter work so a late completion cannot overwrite the UI.
+	@synchronized (self) {
+		++_filterGeneration;
+	}
+
+	// Empty filter — undo on main; cheap, no need to hop threads.
+	if ([filterString length] == 0) {
+		if (isTableListFiltered) {
+			isTableListFiltered = NO;
+			@synchronized (self) {
+				filteredTables = tables;
+				filteredTableTypes = tableTypes;
+			}
+			[tablesListView reloadData];
+		}
+		return;
+	}
+
+	// Capture a coherent snapshot of the backing arrays under the same lock
+	// that protects async refresh writes, then capture our just-bumped
+	// generation token.
+	NSArray *tableSnapshot;
+	NSArray *typeSnapshot;
+	uint64_t myGen;
+	BOOL capturedContainsViews;
+	@synchronized (self) {
+		tableSnapshot = [tables copy];
+		typeSnapshot = [tableTypes copy];
+		capturedContainsViews = tableListContainsViews;
+		myGen = _filterGeneration;
+	}
+
+	NSString *capturedSelected = selectedTableName ? [selectedTableName copy] : nil;
+	SPTableType capturedSelectedType = selectedTableType;
+
+	dispatch_queue_t bgQueue = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
+	dispatch_async(bgQueue, ^{
+		NSMutableArray *filtered = [NSMutableArray array];
+		NSMutableArray *filteredTypes = [NSMutableArray array];
+		NSString *pinnedHeader = NSLocalizedString(@"PINNED", @"header for pinned tables");
+		NSInteger lastTableType = NSNotFound;
+		BOOL isPinnedSection = NO;
+		NSUInteger count = tableSnapshot.count;
+		// Cap the number of visible matches so NSTableView's reloadData
+		// doesn't have to lay out tens of thousands of rows for a one-letter
+		// filter. Anything beyond the cap is summarised at the bottom; the
+		// user keeps typing to narrow the result.
+		const NSUInteger matchLimit = 500;
+		NSUInteger matchCount = 0;
+		NSUInteger truncatedCount = 0;
+
+		for (NSUInteger i = 0; i < count; i++) {
+			id name = [tableSnapshot objectAtIndex:i];
+			NSInteger tableType = (i < typeSnapshot.count)
+			                      ? [[typeSnapshot objectAtIndex:i] integerValue]
+			                      : SPTableTypeNone;
+
+			if (tableType == SPTableTypeNone) {
+				if ([name isKindOfClass:[NSString class]] && [(NSString *)name isEqualToString:pinnedHeader]) {
+					isPinnedSection = YES;
+					[filtered addObject:pinnedHeader];
+					[filteredTypes addObject:@(SPTableTypeNone)];
+				} else {
+					isPinnedSection = NO;
+				}
+				continue;
+			}
+
+			// Defensive: skip rows that are not real NSString table names
+			// (legacy nil / NSNull guards). Without this, the background
+			// regex/substring scan could trip on bridged CF objects.
+			if (![name isKindOfClass:[NSString class]]) continue;
+
+			if (isPinnedSection) {
+				[filtered addObject:name];
+				[filteredTypes addObject:@(tableType)];
+				continue;
+			}
+
+			// Case-insensitive substring scan. Sidebar filter is a quick
+			// type-to-narrow control, not a regex playground — keeping the
+			// hot path purely string-based both speeds it up and avoids
+			// RegexKitLite crashing on uncommon inputs while off-main.
+			NSRange r = [(NSString *)name rangeOfString:filterString options:NSCaseInsensitiveSearch];
+			if (r.location == NSNotFound) continue;
+
+			// We have a match. If we've already hit the visible cap, just
+			// count the rest so we can show "(N more matches…)" at the end.
+			if (matchCount >= matchLimit) {
+				truncatedCount++;
+				continue;
+			}
+			matchCount++;
+
+			if ((tableType == SPTableTypeTable || tableType == SPTableTypeView) && lastTableType == NSNotFound) {
+				[filtered addObject:(capturedContainsViews
+				                     ? NSLocalizedString(@"TABLES & VIEWS", @"header for table & views list")
+				                     : NSLocalizedString(@"TABLES",        @"header for table list"))];
+				[filteredTypes addObject:@(SPTableTypeNone)];
+			} else if ((tableType == SPTableTypeProc || tableType == SPTableTypeFunc)
+				   && (lastTableType == NSNotFound || lastTableType == SPTableTypeTable || lastTableType == SPTableTypeView)) {
+				[filtered addObject:NSLocalizedString(@"PROCS & FUNCS", @"header for procs & funcs list")];
+				[filteredTypes addObject:@(SPTableTypeNone)];
+			}
+			lastTableType = tableType;
+			[filtered addObject:name];
+			[filteredTypes addObject:@(tableType)];
+		}
+
+		if ([filtered count] == 0) {
+			[filtered addObject:NSLocalizedString(@"NO MATCHES", @"header for no matches in filtered list")];
+			[filteredTypes addObject:@(SPTableTypeNone)];
+		}
+
+		if (truncatedCount > 0) {
+			NSString *fmt = NSLocalizedStringWithDefaultValue(
+				@"SATablesList.filterTruncated", nil, [NSBundle mainBundle],
+				@"… %lu more matches (keep typing to narrow)",
+				@"footer shown when the sidebar filter result was truncated");
+			[filtered addObject:[NSString stringWithFormat:fmt, (unsigned long)truncatedCount]];
+			[filteredTypes addObject:@(SPTableTypeNone)];
+		}
+
+		if (capturedSelected && [filtered indexOfObject:capturedSelected] == NSNotFound) {
+			[filtered addObject:NSLocalizedString(@"CURRENT SELECTION", @"header for current selection in filtered list")];
+			[filteredTypes addObject:@(SPTableTypeNone)];
+			[filtered addObject:capturedSelected];
+			[filteredTypes addObject:@(capturedSelectedType)];
+		}
+
+		dispatch_async(dispatch_get_main_queue(), ^{
+			// Stale check — a newer keystroke may have already produced a
+			// fresher filtered list; drop ours silently if so.
+			uint64_t currentGen;
+			@synchronized (self) { currentGen = _filterGeneration; }
+			if (myGen != currentGen) return;
+
+			@synchronized (self) {
+				filteredTables = filtered;
+				filteredTableTypes = filteredTypes;
+			}
+			isTableListFiltered = YES;
+
+			if ([tablesListView numberOfRows] < (NSInteger)[filteredTables count]) {
+				[tablesListView noteNumberOfRowsChanged];
+			}
+			if (capturedSelected && [filteredTables indexOfObject:capturedSelected] < NSNotFound) {
+				[tablesListView selectRowIndexes:[NSIndexSet indexSetWithIndex:[filteredTables indexOfObject:capturedSelected]] byExtendingSelection:NO];
+			}
+			[tablesListView reloadData];
+		});
+	});
 }
 
 /**
@@ -2489,12 +2976,15 @@ static NSString *SPNewTableCollation    = @"SPNewTableCollation";
 		[mySQLConnection queryString:@"SET FOREIGN_KEY_CHECKS = 1"];
 	}
 
-    [self updateTables:self]; // do full refresh
-
-	[tableDocumentInstance updateWindowTitle:self];
-
-	// Query the structure of all databases in the background (mainly for completion)
-	[[tableDocumentInstance databaseStructureRetrieval] queryDbStructureInBackgroundWithUserInfo:@{@"forceUpdate" : @YES}];
+    // Refresh the tables list, then force a structure refresh once the swap
+    // completes — column metadata depends on the new table set.
+    __weak SPTablesList *weakSelf = self;
+    [self updateTables:self completion:^{
+        SPTablesList *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf->tableDocumentInstance updateWindowTitle:strongSelf];
+        [[strongSelf->tableDocumentInstance databaseStructureRetrieval] queryDbStructureInBackgroundWithUserInfo:@{@"forceUpdate" : @YES}];
+    }];
 }
 
 /**
@@ -2825,6 +3315,9 @@ static NSString *SPNewTableCollation    = @"SPNewTableCollation";
 		[self _moveTable:tableName from:mySQLConnection.database to:targetDatabaseName tempTable:tempTableName];
 
 		SPMainQSync(^{
+			// Bump before changing the connection's active database, so any
+			// in-flight introspection cannot swap stale tables for the old db.
+			[self bumpSchemaRefreshGeneration];
 			[self->mySQLConnection selectDatabase:targetDatabaseName];
 			[self->tableDocumentInstance selectDatabase:targetDatabaseName item:nil];
 			[self _renameTableOfType:SPTableTypeTableNewDB from:tempTableName to:tableName];

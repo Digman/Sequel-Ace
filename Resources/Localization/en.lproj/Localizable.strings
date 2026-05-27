@@ -3435,3 +3435,20 @@
 
 /* Cell context menu filter submenu title */
 "Filter by Selected Value" = "Filter by Selected Value";
+
+/* Label for the per-favorite schema loading mode popup */
+"SAFavoriteSchemaLoading.label" = "Schema:";
+
+/* Auto schema loading title */
+"SAFavoriteSchemaLoading.option.auto" = "Auto (load all)";
+
+/* Light schema loading title */
+"SAFavoriteSchemaLoading.option.light" = "Light (names only)";
+
+/* Manual schema loading title */
+"SAFavoriteSchemaLoading.option.manual" = "Manual (sync on demand)";
+
+/* footer shown when the sidebar filter result was truncated; %lu is the
+   number of additional matches that were hidden because the visible cap
+   was reached. */
+"SATablesList.filterTruncated" = "… %lu more matches (keep typing to narrow)";

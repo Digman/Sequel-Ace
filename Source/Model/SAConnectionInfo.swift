@@ -52,6 +52,11 @@ struct SAConnectionInfo {
     var timeZoneMode: SAConnectionTimeZoneMode = .useServerTZ
     var timeZoneIdentifier: String = ""
 
+    // MARK: Schema Loading
+
+    /// Raw `SASchemaLoadingMode` value; 0 = Auto, 1 = Light, 2 = Manual.
+    var schemaLoadingMode: Int = 0
+
     // MARK: Special Settings
 
     var allowDataLocalInfile: Int = 0
@@ -202,6 +207,11 @@ struct SAConnectionInfo {
     @objc var timeZoneMode: SAConnectionTimeZoneMode {
         get { info.timeZoneMode }
         set { info.timeZoneMode = newValue }
+    }
+
+    @objc var schemaLoadingMode: Int {
+        get { info.schemaLoadingMode }
+        set { info.schemaLoadingMode = newValue }
     }
 
     @objc var timeZoneIdentifier: String {

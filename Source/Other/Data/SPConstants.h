@@ -561,7 +561,11 @@ extern NSString *SPFavoriteVaultPortKey;
 extern NSString *SPFavoriteVaultOIDCMountKey;
 extern NSString *SPFavoriteVaultCredentialsPathKey;
 
+// Per-favorite schema loading mode (SASchemaLoadingMode raw value; missing defaults to Auto/0)
+extern NSString *SPFavoriteSchemaLoadingModeKey;
+
 extern NSString *SPConnectionFavoritesChangedNotification;
+extern NSString *SPDBTableListWasUpdatedNotification;
 extern NSString *SPConnectionShownSocketHelp;
 extern NSString *SPStaleBookmarksHelp;
 extern NSString *SPDocsAppSandbox;

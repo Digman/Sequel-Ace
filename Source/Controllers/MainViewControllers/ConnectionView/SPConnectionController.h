@@ -209,6 +209,23 @@ typedef NS_ENUM(NSInteger, SPConnectionTimeZoneMode) {
 	IBOutlet NSPopUpButton *standardTimeZoneField;
 	IBOutlet NSPopUpButton *sshTimeZoneField;
 	IBOutlet NSPopUpButton *socketTimeZoneField;
+
+	// Schema-loading row — one popup + label per tab form, mirroring the
+	// Time Zone pattern (visual: 5 popups, model: a single
+	// `schemaLoadingMode` property they all bind to). Created
+	// programmatically in `setupSchemaLoadingControls` so the XIB stays
+	// untouched.
+	NSPopUpButton *standardSchemaLoadingPopUp;
+	NSPopUpButton *socketSchemaLoadingPopUp;
+	NSPopUpButton *sshSchemaLoadingPopUp;
+	NSPopUpButton *awsIAMSchemaLoadingPopUp;
+	NSPopUpButton *vaultSchemaLoadingPopUp;
+	NSTextField *standardSchemaLoadingLabel;
+	NSTextField *socketSchemaLoadingLabel;
+	NSTextField *sshSchemaLoadingLabel;
+	NSTextField *awsIAMSchemaLoadingLabel;
+	NSTextField *vaultSchemaLoadingLabel;
+
 	IBOutlet NSButton *standardSSLKeyFileButton;
 	IBOutlet NSButton *standardSSLCertificateButton;
 	IBOutlet NSButton *standardSSLCACertButton;
@@ -269,6 +286,8 @@ typedef NS_ENUM(NSInteger, SPConnectionTimeZoneMode) {
 @property (readwrite, copy) NSString *port;
 @property (readwrite) SPConnectionTimeZoneMode timeZoneMode;
 @property (readwrite, copy) NSString *timeZoneIdentifier;
+// Per-favorite schema loading mode (`SASchemaLoadingMode` raw value). Default Auto/0.
+@property (readwrite) NSInteger schemaLoadingMode;
 @property (readwrite) NSInteger allowDataLocalInfile;
 @property (readwrite) NSInteger enableClearTextPlugin;
 // AWS IAM Authentication (profile-based only)
@@ -317,6 +336,7 @@ typedef NS_ENUM(NSInteger, SPConnectionTimeZoneMode) {
 // Connection processes
 - (IBAction)initiateConnection:(id)sender;
 - (IBAction)cancelConnection:(id)sender;
+- (IBAction)schemaLoadingPopUpChanged:(id)sender;
 
 // Interface interaction
 - (void)nodeDoubleClicked:(id)sender;

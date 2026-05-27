@@ -115,6 +115,10 @@ import AppKit
         guard let document = windowController?.databaseDocument else { return }
 
         // 2. Hand off the established connection to the new document.
+        // Propagate the schema loading mode first so SPTablesList's Manual gate
+        // and SPDatabaseStructure's mode guard see the right value on the
+        // first setConnection: dispatch.
+        document.currentSchemaLoadingMode = info.schemaLoadingMode
         // setConnection: transitions the document out of connection mode
         // into the database UI (same as the embedded flow's addConnectionToDocument).
         document.setConnection(connection)

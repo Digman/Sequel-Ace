@@ -1099,30 +1099,30 @@ set_input:
 - (void)_checkForDatabaseChanges
 {
 	NSUInteger i = [tables count];
-	
-	[tablesListInstance updateTables:self];
 
-	NSUInteger j = [[[NSOrderedSet alloc] initWithArray:[tablesListInstance allTableAndViewNames]] count];
-	
-	// If this is an SQL export, include procs and functions
-	if (exportType == SPSQLExport) {
-		j += [[[NSOrderedSet alloc] initWithArray:[tablesListInstance allProcedureNames]] count];
-		j += [[[NSOrderedSet alloc] initWithArray:[tablesListInstance allFunctionNames]] count];
-	}
-		
-	if (j > i) {
-		NSUInteger diff = j - i;
-		[NSAlert createDefaultAlertWithTitle:NSLocalizedString(@"The list of tables has changed", @"table list change alert message") message:[NSString stringWithFormat:NSLocalizedString(@"The number of tables in this database has changed since the export dialog was opened. There are now %lu additional table(s), most likely added by an external application.\n\nHow would you like to proceed?", @"table list change alert informative message"), (unsigned long)diff] primaryButtonTitle:NSLocalizedString(@"Continue", @"continue button") primaryButtonHandler:^{
-			// Initialize the export after a short delay to give the alert a chance to close
-			[self performSelector:@selector(initializeExportUsingSelectedOptions) withObject:nil afterDelay:0.5];
-		} cancelButtonHandler:^{
-			// Cancel the export and redisplay the export dialog after a short delay
-			[self performSelector:@selector(exportData) withObject:self afterDelay:0.5];
-		}];
-	}
-	else {
-		[self initializeExportUsingSelectedOptions];
-	}
+	// Refresh the tables list, then count after the swap completes. The
+	// comparison only makes sense against post-refresh data, so it must run
+	// inside the completion block.
+	[tablesListInstance updateTables:self completion:^{
+		NSUInteger j = [[[NSOrderedSet alloc] initWithArray:[self->tablesListInstance allTableAndViewNames]] count];
+
+		if (self->exportType == SPSQLExport) {
+			j += [[[NSOrderedSet alloc] initWithArray:[self->tablesListInstance allProcedureNames]] count];
+			j += [[[NSOrderedSet alloc] initWithArray:[self->tablesListInstance allFunctionNames]] count];
+		}
+
+		if (j > i) {
+			NSUInteger diff = j - i;
+			[NSAlert createDefaultAlertWithTitle:NSLocalizedString(@"The list of tables has changed", @"table list change alert message") message:[NSString stringWithFormat:NSLocalizedString(@"The number of tables in this database has changed since the export dialog was opened. There are now %lu additional table(s), most likely added by an external application.\n\nHow would you like to proceed?", @"table list change alert informative message"), (unsigned long)diff] primaryButtonTitle:NSLocalizedString(@"Continue", @"continue button") primaryButtonHandler:^{
+				[self performSelector:@selector(initializeExportUsingSelectedOptions) withObject:nil afterDelay:0.5];
+			} cancelButtonHandler:^{
+				[self performSelector:@selector(exportData) withObject:self afterDelay:0.5];
+			}];
+		}
+		else {
+			[self initializeExportUsingSelectedOptions];
+		}
+	}];
 }
 
 /**
